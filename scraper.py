@@ -30,12 +30,20 @@ def print_summary(result: ScrapeResult):
     print(f"  Ospiti:       {result.adults} adulti, {result.children} bambini")
     print(f"  Hotel trovati:{result.n_hotels}")
     print()
-    print(f"  {'Hotel':<40} {'Località':<20} {'Voto':>5} {'$/notte':>8} {'3 notti':>8}")
-    print(f"  {'─'*40} {'─'*20} {'─'*5} {'─'*8} {'─'*8}")
+    print(
+        f"  {'Hotel':<36} {'Località':<18} {'Lat':>9} {'Lng':>10} "
+        f"{'Voto':>5} {'$/notte':>8} {'3 notti':>8}"
+    )
+    print(f"  {'─'*36} {'─'*18} {'─'*9} {'─'*10} {'─'*5} {'─'*8} {'─'*8}")
     for h in result.hotels:
-        name = h.name[:38]
-        loc = h.location[:18]
-        print(f"  {name:<40} {loc:<20} {h.rating:>5} {h.price_per_night:>8} {h.total_price:>8}")
+        name = h.name[:34]
+        loc = h.location[:16]
+        lat_s = (h.latitude or "-")[:8] if h.latitude else "-"
+        lng_s = (h.longitude or "-")[:9] if h.longitude else "-"
+        print(
+            f"  {name:<36} {loc:<18} {lat_s:>9} {lng_s:>10} "
+            f"{h.rating:>5} {h.price_per_night:>8} {h.total_price:>8}"
+        )
     print()
     print(f"  HTML:  {result.html_file}")
     print(f"  JSON:  {result.json_file}")

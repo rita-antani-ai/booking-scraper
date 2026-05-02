@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 class Hotel(BaseModel):
     name: str
     location: str = ""
+    latitude: str = ""
+    longitude: str = ""
     rating: str = ""
     label: str = ""
     reviews: str = ""
