@@ -6,8 +6,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # Paths
 PROJECT_ROOT = Path(__file__).parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -32,6 +30,9 @@ KEEP_PARAMS = {
     "flex_window", "nflt", "broad_search_not_eligible",
 }
 
-# Ensure dirs exist
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def init_storage() -> None:
+    """Load environment and ensure output directories exist. Call once from main()."""
+    load_dotenv()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)

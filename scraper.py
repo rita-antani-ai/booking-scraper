@@ -13,12 +13,12 @@ import asyncio
 import argparse
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 from url_utils import normalize_url, hash_url, extract_search_params, extract_dest_label
 from fetcher import fetch_page
 from parser import parse_hotels
-from storage import is_visited, save_result, load_stored_page, load_index
+from config import init_storage
+from storage import get_index_entry, save_result, load_stored_page, load_index, resolve_stored_path
 from models import ScrapeResult
 
 
@@ -76,10 +76,10 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
         html, page_suffix = loaded
         print(f"♻️  Re-parse da file salvato (hash: {url_hash})")
     elif not force:
-        existing = is_visited(url_hash)
+        existing = get_index_entry(url_hash)
         if existing:
             print(f"✅ Già visitata il {existing['scraped_at'][:19]}")
-            json_path = Path(existing["json_file"])
+            json_path = resolve_stored_path(existing["json_file"])
             if json_path.is_file():
                 result = ScrapeResult.model_validate_json(
                     json_path.read_text(encoding="utf-8")
@@ -126,6 +126,7 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
 
 
 def main():
+    init_storage()
     parser = argparse.ArgumentParser(
         description="Scrape Booking.com search results"
     )

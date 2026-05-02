@@ -6,16 +6,30 @@ Supports multiple backends:
 - firecrawl: uses Firecrawl API (requires FIRECRAWL_API_KEY env var)
 """
 
-import json
 import os
+from urllib.parse import urlparse
 
 import httpx
 
 from config import USER_AGENT, REQUEST_TIMEOUT, MAX_RETRIES
 
+_BOOKING_HOST = "booking.com"
+
+
+def _validate_booking_fetch_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError(f"Fetch only supports http(s) URLs, got {url!r}")
+    host = (parsed.hostname or "").lower()
+    if not host or not (
+        host == _BOOKING_HOST or host.endswith(f".{_BOOKING_HOST}")
+    ):
+        raise RuntimeError(f"Fetch restricted to Booking.com hosts: {url!r}")
+
 
 async def fetch_httpx(url: str) -> str:
     """Direct HTTP fetch with httpx. Works for sites without anti-bot."""
+    _validate_booking_fetch_url(url)
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -47,6 +61,7 @@ def fetch_firecrawl(url: str) -> str:
     Returns markdown content of the page.
     Requires FIRECRAWL_API_KEY env var.
     """
+    _validate_booking_fetch_url(url)
     api_key = os.environ.get("FIRECRAWL_API_KEY", "")
     if not api_key:
         raise RuntimeError(
@@ -76,7 +91,15 @@ def fetch_firecrawl(url: str) -> str:
     if not data.get("success"):
         raise RuntimeError(f"Firecrawl error: {data}")
 
-    return data["data"]["markdown"]
+    inner = data.get("data") or {}
+    markdown = inner.get("markdown") if isinstance(inner, dict) else None
+    if not markdown:
+        snippet = str(data)[:800]
+        raise RuntimeError(
+            "Firecrawl response missing data.markdown; payload snippet: "
+            f"{snippet!r}"
+        )
+    return markdown
 
 
 async def fetch_page(url: str, backend: str = "auto") -> tuple[str, str]:

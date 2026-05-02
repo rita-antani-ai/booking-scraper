@@ -26,7 +26,8 @@ def normalize_url(url: str) -> str:
 
     # Sort for determinism
     sorted_query = urlencode(filtered, doseq=True)
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{sorted_query}"
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return f"{base}?{sorted_query}" if sorted_query else base
 
 
 def hash_url(normalized_url: str) -> str:

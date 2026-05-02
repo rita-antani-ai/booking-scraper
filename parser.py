@@ -102,10 +102,21 @@ def parse_hotels(content: str) -> list[Hotel]:
             current["location"] = loc_match.group(1).strip()
             continue
 
-        # --- Rating: Scored X.X ---
-        rating_match = re.search(r"Scored (\d+\.\d+)", s)
+        # --- Rating: several Booking / locale patterns ---
+        rating_match = None
+        for pat in (
+            r"Scored (\d+[.,]\d+)",
+            r"Review score (\d+[.,]\d+)",
+            r"(\d+[.,]\d+)\s*/\s*10",
+            r"(?:rating|bewertung|note|valutazione)\s*[:\s]+(\d+[.,]\d+)",
+            r"(\d+[.,]\d+)\s+out of\s+10",
+            r"(?:★|⭐)\s*(\d+[.,]\d+)",
+        ):
+            rating_match = re.search(pat, s, re.IGNORECASE)
+            if rating_match:
+                break
         if rating_match and current:
-            current["rating"] = rating_match.group(1)
+            current["rating"] = rating_match.group(1).replace(",", ".")
             continue
 
         # --- Reviews: N reviews / N recensioni ---
@@ -129,7 +140,10 @@ def parse_hotels(content: str) -> list[Hotel]:
         # --- Price per night: line after "Per night" ---
         if s == "Per night" and current:
             for j in range(i + 1, min(i + 4, len(lines))):
-                price_match = re.match(r"^\$(\d[\d,]*)$", lines[j].strip())
+                price_match = re.match(
+                    r"^[\$€£¥]?\s*(\d[\d,]*)\s*[\$€£¥]?$",
+                    lines[j].strip(),
+                )
                 if price_match:
                     current.setdefault("price_per_night", price_match.group(1).replace(",", ""))
                     break
@@ -138,12 +152,16 @@ def parse_hotels(content: str) -> list[Hotel]:
         # --- Total price: line with "Price $N" or "Original price ... Current price $N" ---
         if current and "total_price" not in current:
             # Original price line (discounted)
-            discount = re.search(r"Current price \$(\d[\d,]*)", s)
+            discount = re.search(
+                r"Current price\s+[\$€£¥]?\s*(\d[\d,]*)",
+                s,
+                re.IGNORECASE,
+            )
             if discount:
                 current["total_price"] = discount.group(1).replace(",", "")
                 continue
             # Plain price line
-            plain = re.match(r"^Price \$(\d[\d,]*)$", s)
+            plain = re.match(r"^Price\s+[\$€£¥]?\s*(\d[\d,]*)$", s, re.IGNORECASE)
             if plain:
                 current["total_price"] = plain.group(1).replace(",", "")
                 continue

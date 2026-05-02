@@ -2,7 +2,7 @@
 Data models for Booking.com hotel results.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Hotel(BaseModel):
@@ -30,6 +30,6 @@ class ScrapeResult(BaseModel):
     adults: int = 0
     children: int = 0
     n_hotels: int = 0
-    hotels: list[Hotel] = []
+    hotels: list[Hotel] = Field(default_factory=list)
     html_file: str = ""
     json_file: str = ""

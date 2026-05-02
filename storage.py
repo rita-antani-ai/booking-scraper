@@ -5,16 +5,23 @@ Storage: index.json management and result file I/O.
 import json
 import os
 import tempfile
+from pathlib import Path
 
-from config import RESULTS_DIR, INDEX_FILE
+from config import RESULTS_DIR, INDEX_FILE, PROJECT_ROOT
 from models import ScrapeResult
 
 
 def load_index() -> dict:
-    """Load the index file, return empty dict if missing."""
-    if INDEX_FILE.exists():
-        return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
-    return {}
+    """Load the index file, return empty dict if missing or invalid."""
+    if not INDEX_FILE.exists():
+        return {}
+    try:
+        data = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def save_index(index: dict):
@@ -38,13 +45,26 @@ def save_index(index: dict):
         raise
 
 
-def is_visited(url_hash: str) -> dict | None:
+def resolve_stored_path(stored: str) -> Path:
+    """Resolve a path from the index (relative to PROJECT_ROOT or legacy absolute)."""
+    p = Path(stored)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
+
+
+def get_index_entry(url_hash: str) -> dict | None:
     """
-    Check if a URL hash exists in the index.
-    Returns the index entry if found, None otherwise.
+    Return the index entry for a URL hash if present, else None.
     """
     index = load_index()
-    return index.get(url_hash)
+    entry = index.get(url_hash)
+    return entry if isinstance(entry, dict) else None
+
+
+def is_visited(url_hash: str) -> bool:
+    """True if this URL hash exists in the index."""
+    return get_index_entry(url_hash) is not None
 
 
 def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html") -> str:
@@ -84,8 +104,8 @@ def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html
         "adults": result.adults,
         "children": result.children,
         "n_hotels": result.n_hotels,
-        "html_file": str(raw_path),
-        "json_file": str(json_path),
+        "html_file": str(raw_path.relative_to(PROJECT_ROOT)),
+        "json_file": str(json_path.relative_to(PROJECT_ROOT)),
     }
     save_index(index)
 
