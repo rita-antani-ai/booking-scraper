@@ -45,7 +45,7 @@ There is **no hosted service**, **no multi-tenant UX**, and **no GUI** beyond te
 | ID | Goal | Measurable indicator |
 |----|------|----------------------|
 | G1 | Persist a scrape for every distinct normalized search URL | Exactly one folder per SHA-256-derived 12-character hash appears under `output/results/` |
-| G2 | Make re-scrapes optional | Second run without `--force` does not trigger `fetch_page` |
+| G2 | Make re-scrapes optional | On cache hit without `--force`, `fetch_page` runs only after the user confirms overwrite (`s`/`si`); answering `n`/`no` exits without fetch. `--force` always fetches and skips the prompt. |
 | G3 | Support both raw HTML and Firecrawl markdown | Successful parse produces non-empty `hotels[]` where page structure matches assumptions |
 | G4 | Operate reliably on constrained networks | `httpx`: configurable timeout (`30`s) and retries (`MAX_RETRIES = 2` → up to `3` attempts) |
 
@@ -159,8 +159,9 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
 |----|-------------|---------------------|
 | F14 | **Init** | Calls `init_storage()` → loads `.env` via python-dotenv, ensures `output/` trees exist. |
 | F15 | **No URL** without `--list` | Prints argparse help text and exits status `1`. |
-| F16 | **Cache hit path** | If not `force`, not `reparse`, entry exists for hash → print Italian confirmation + load `hotels.json` via Pydantic and `print_summary` if file exists; no fetch. |
-| F17 | **Reparse guard** | If `--reparse` and no saved page → error message referencing hash + exit gracefully (no traceback requirement). |
+| F16 | **Cache hit path** | If not `force`, not `reparse`, entry exists for hash → load `hotels.json` via Pydantic and `print_summary` when the file exists; if JSON is missing, print indexed fields (scrape time, destinazione, `n_hotels`) plus warning. |
+| F17 | **Cache overwrite confirmation** | After summary (F16), `input()` prompts in Italian (“Questa ricerca è già stata effettuata il *[first 19 chars of ISO `scraped_at`]* … (s/n)”). Answers **`s`** / **`si`** → `fetch_page` then `save_result` (same **`url_hash`** / **`output/results/<hash>/`**). **`n`** / **`no`** → exit **`0`** without fetch—case-insensitive **after strip**; invalid replies re-prompt with a clarifying Italian line. **`--force` bypasses this prompt** (immediate fetch). |
+| F18 | **Reparse guard** | If `--reparse` and no saved page → error message referencing hash + exit gracefully (no traceback requirement). |
 
 ### 4.8 Terminal summaries
 
@@ -236,15 +237,20 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
 ```mermaid
 flowchart LR
   A[User URL argv] --> B[normalize_url + hash_url]
-  B --> C{Visited? force? reparse?}
-  C -->|cache hit| D[Load hotels.json → print_summary]
-  C -->|reparse| E[load_stored_page]
-  C -->|fetch| F[fetch_page]
-  F --> G[parse_hotels]
-  E --> G
-  G --> H[Construct ScrapeResult]
-  H --> I[save_result write page + hotels.json + index]
-  I --> J[Terminal summary]
+  B --> C{reparse?}
+  C -->|yes| E[load_stored_page]
+  C -->|no| Q{force?}
+  Q -->|yes| F[fetch_page]
+  Q -->|no| R{index has hash?}
+  R -->|no| F
+  R -->|yes| G[print_summary → input s/n]
+  G -->|n / no| Z[exit no fetch]
+  G -->|s / si| F
+  F --> H[parse_hotels]
+  E --> H
+  H --> I[Construct ScrapeResult]
+  I --> J[save_result write page + hotels.json + index]
+  J --> K[Terminal summary]
 ```
 
 ### 6.3 Runtime dependencies between modules
@@ -345,7 +351,7 @@ Shell quoting requirement: Operators must quote URLs containing shell metacharac
 
 | Flag | Values | Default | Effect |
 |------|--------|---------|--------|
-| `--force` | boolean | False | Bypass visit cache → always fetch (unless `--reparse` path). Overwrites artifact directory contents for that hash (`write_text` replacements). |
+| `--force` | boolean | False | Bypass cache overwrite **`input()`** prompt and visit cache → always fetch (unless `--reparse` path). Overwrites artifact directory contents for that hash (`write_text` replacements). |
 | `--reparse` | boolean | False | Loads stored `page.html` or `page.md` via hash computed from normalized input URL → parse only; errors if absent. `--force` not required to refresh JSON from stale HTML manually if cache miss logic bypassed—not combined with initial visit skip except user supplies matching URL hash content. *(Product behavior: skips fetch entirely.)* |
 | `--backend` | `auto`, `httpx`, `firecrawl` | `auto` | Select fetch implementation; **`auto`** keys off presence of **`FIRECRAWL_API_KEY`**. Ignored during `--reparse`. |
 | `--list` | boolean | False | Print index table sorted by scrape time descending; **`url` not required.** |
@@ -354,8 +360,8 @@ Mutually nuanced flows:
 
 | `--force` | `--reparse` | Interpretation |
 |-----------|---------------|----------------|
-| False | False | Cached short-circuit on known hash |
-| True | False | Always fetch unless… |
+| False | False | Known hash → show cached **`print_summary`** + overwrite prompt (`input`); fetch only if user confirms `s`/`si` |
+| True | False | Always fetch (`--force`); skips overwrite prompt |
 | * | True | Ignore cache for fetch logic; loads disk; **does not honor `--force`** for fetch (already no HTTP) |
 
 ### 8.3 Exit codes / stdout behavior

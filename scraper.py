@@ -42,6 +42,21 @@ def print_summary(result: ScrapeResult):
     print()
 
 
+def _prompt_cache_overwrite(scraped_date: str) -> bool:
+    """Return True if the user confirms overwriting cached results."""
+    prompt = (
+        f"Questa ricerca è già stata effettuata il {scraped_date}. "
+        "Vuoi sovrascrivere con risultati più recenti? (s/n) "
+    )
+    while True:
+        ans = input(prompt).strip().lower()
+        if ans in ("s", "si"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print("(Rispondi 's', 'si', 'n' o 'no'.)")
+
+
 def print_index():
     """List all visited searches."""
     index = load_index()
@@ -78,7 +93,6 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
     elif not force:
         existing = get_index_entry(url_hash)
         if existing:
-            print(f"✅ Già visitata il {existing['scraped_at'][:19]}")
             json_path = resolve_stored_path(existing["json_file"])
             if json_path.is_file():
                 result = ScrapeResult.model_validate_json(
@@ -87,14 +101,22 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
                 print_summary(result)
             else:
                 print(f"   ⚠️  File JSON non trovato: {json_path}")
-            return
+                print()
+                print(f"  Data scrape:    {existing['scraped_at'][:19]}")
+                print(f"  Destinazione:   {existing.get('dest_label') or 'N/A'}")
+                print(f"  Hotel (indice): {existing.get('n_hotels', '?')}")
+                print()
+            scraped_slice = existing["scraped_at"][:19]
+            if not _prompt_cache_overwrite(scraped_slice):
+                return
+
+    if not reparse:
         html, used_backend = await fetch_page(url, backend=backend)
         page_suffix = "md" if used_backend == "firecrawl" else "html"
-        print(f"📥 Pagina scaricata ({len(html):,} caratteri)")
-    else:
-        html, used_backend = await fetch_page(url, backend=backend)
-        page_suffix = "md" if used_backend == "firecrawl" else "html"
-        print(f"📥 Pagina scaricata — forzato re-scrape ({len(html):,} caratteri)")
+        if force:
+            print(f"📥 Pagina scaricata — forzato re-scrape ({len(html):,} caratteri)")
+        else:
+            print(f"📥 Pagina scaricata ({len(html):,} caratteri)")
 
     # --- Parse ---
     hotels = parse_hotels(html)
