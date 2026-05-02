@@ -6,14 +6,75 @@ Extracts hotel listings from the search results page.
 """
 
 import re
+from html.parser import HTMLParser
+
 from models import Hotel
+
+
+class _HTMLToText(HTMLParser):
+    """Strip tags to plain text with newlines for block elements."""
+
+    _BLOCK = frozenset(
+        ("p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "tr", "section", "article")
+    )
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self._skip = True
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+        elif tag == "br":
+            self._parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "br":
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript"):
+            self._skip = False
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip and data:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._parts)
+
+
+def _looks_like_html(content: str) -> bool:
+    head = content.lstrip()[:800].lower()
+    if head.startswith("<!doctype") or head.startswith("<html"):
+        return True
+    pos = head.find("<html")
+    return 0 <= pos < 400
+
+
+def _html_to_text(html: str) -> str:
+    parser = _HTMLToText()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return html
+    return parser.get_text()
 
 
 def parse_hotels(content: str) -> list[Hotel]:
     """
     Extract hotel listings from Booking.com page content.
-    Works with both raw HTML and markdown-rendered content.
+    Works with markdown (Firecrawl), raw HTML (httpx), and HTML converted to text.
     """
+    if _looks_like_html(content):
+        content = _html_to_text(content)
+
     lines = content.split("\n")
     hotels: list[Hotel] = []
     current: dict = {}

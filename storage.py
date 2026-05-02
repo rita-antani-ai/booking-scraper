@@ -3,11 +3,11 @@ Storage: index.json management and result file I/O.
 """
 
 import json
-from datetime import datetime, timezone
-from pathlib import Path
+import os
+import tempfile
 
-from config import OUTPUT_DIR, RESULTS_DIR, INDEX_FILE
-from models import ScrapeResult, Hotel
+from config import RESULTS_DIR, INDEX_FILE
+from models import ScrapeResult
 
 
 def load_index() -> dict:
@@ -18,11 +18,24 @@ def load_index() -> dict:
 
 
 def save_index(index: dict):
-    """Write the index file."""
-    INDEX_FILE.write_text(
-        json.dumps(index, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    """Write the index file atomically (temp + replace)."""
+    INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(index, indent=2, ensure_ascii=False)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=INDEX_FILE.parent,
+        prefix=".index.",
+        suffix=".json.tmp",
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, INDEX_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def is_visited(url_hash: str) -> dict | None:
@@ -34,18 +47,22 @@ def is_visited(url_hash: str) -> dict | None:
     return index.get(url_hash)
 
 
-def save_result(result: ScrapeResult, html_content: str) -> str:
+def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html") -> str:
     """
-    Save HTML and JSON for a scrape result.
+    Save raw page (HTML or markdown) and JSON for a scrape result.
+    page_suffix: "html" for httpx HTML, "md" for Firecrawl markdown.
     Returns the path to the JSON file.
     """
     result_dir = RESULTS_DIR / result.url_hash
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save raw HTML
-    html_path = result_dir / "page.html"
-    html_path.write_text(html_content, encoding="utf-8")
-    result.html_file = str(html_path)
+    if page_suffix == "md":
+        raw_path = result_dir / "page.md"
+    else:
+        raw_path = result_dir / "page.html"
+
+    raw_path.write_text(raw_content, encoding="utf-8")
+    result.html_file = str(raw_path)
 
     # Save structured JSON
     json_path = result_dir / "hotels.json"
@@ -67,7 +84,7 @@ def save_result(result: ScrapeResult, html_content: str) -> str:
         "adults": result.adults,
         "children": result.children,
         "n_hotels": result.n_hotels,
-        "html_file": str(html_path),
+        "html_file": str(raw_path),
         "json_file": str(json_path),
     }
     save_index(index)
@@ -75,9 +92,14 @@ def save_result(result: ScrapeResult, html_content: str) -> str:
     return str(json_path)
 
 
-def load_result_from_html(url_hash: str) -> str | None:
-    """Load raw HTML for re-parsing. Returns None if not found."""
-    html_path = RESULTS_DIR / url_hash / "page.html"
-    if html_path.exists():
-        return html_path.read_text(encoding="utf-8")
+def load_stored_page(url_hash: str) -> tuple[str, str] | None:
+    """
+    Load saved raw page for re-parsing.
+    Returns (content, page_suffix) with page_suffix "html" or "md", or None.
+    """
+    result_dir = RESULTS_DIR / url_hash
+    for name, suffix in (("page.html", "html"), ("page.md", "md")):
+        path = result_dir / name
+        if path.exists():
+            return path.read_text(encoding="utf-8"), suffix
     return None

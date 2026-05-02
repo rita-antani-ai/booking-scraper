@@ -79,9 +79,11 @@ def fetch_firecrawl(url: str) -> str:
     return data["data"]["markdown"]
 
 
-async def fetch_page(url: str, backend: str = "auto") -> str:
+async def fetch_page(url: str, backend: str = "auto") -> tuple[str, str]:
     """
     Fetch a page using the specified backend.
+
+    Returns (content, backend_used) where backend_used is "httpx" or "firecrawl".
 
     backends:
         - "auto": try firecrawl if key exists, else httpx
@@ -93,6 +95,7 @@ async def fetch_page(url: str, backend: str = "auto") -> str:
         backend = "firecrawl" if has_key else "httpx"
 
     if backend == "firecrawl":
-        return fetch_firecrawl(url)
+        return fetch_firecrawl(url), "firecrawl"
     else:
-        return await fetch_httpx(url)
+        content = await fetch_httpx(url)
+        return content, "httpx"

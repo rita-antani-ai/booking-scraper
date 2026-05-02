@@ -13,11 +13,12 @@ import asyncio
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-from url_utils import normalize_url, hash_url, extract_search_params
+from url_utils import normalize_url, hash_url, extract_search_params, extract_dest_label
 from fetcher import fetch_page
 from parser import parse_hotels
-from storage import is_visited, save_result, load_result_from_html, load_index
+from storage import is_visited, save_result, load_stored_page, load_index
 from models import ScrapeResult
 
 
@@ -64,24 +65,35 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
     url_hash = hash_url(normalized)
     params = extract_search_params(url)
     now = datetime.now(timezone.utc).isoformat()
+    page_suffix = "html"
 
     # --- Check if already visited ---
     if reparse:
-        html = load_result_from_html(url_hash)
-        if not html:
-            print(f"❌ Nessun HTML salvato per hash {url_hash}. Scrape prima senza --reparse.")
+        loaded = load_stored_page(url_hash)
+        if not loaded:
+            print(f"❌ Nessuna pagina salvata per hash {url_hash}. Scrape prima senza --reparse.")
             return
-        print(f"♻️  Re-parse da HTML salvato (hash: {url_hash})")
+        html, page_suffix = loaded
+        print(f"♻️  Re-parse da file salvato (hash: {url_hash})")
     elif not force:
         existing = is_visited(url_hash)
         if existing:
             print(f"✅ Già visitata il {existing['scraped_at'][:19]}")
-            print(f"   {existing['n_hotels']} hotel → {existing['json_file']}")
+            json_path = Path(existing["json_file"])
+            if json_path.is_file():
+                result = ScrapeResult.model_validate_json(
+                    json_path.read_text(encoding="utf-8")
+                )
+                print_summary(result)
+            else:
+                print(f"   ⚠️  File JSON non trovato: {json_path}")
             return
-        html = await fetch_page(url, backend=backend)
+        html, used_backend = await fetch_page(url, backend=backend)
+        page_suffix = "md" if used_backend == "firecrawl" else "html"
         print(f"📥 Pagina scaricata ({len(html):,} caratteri)")
     else:
-        html = await fetch_page(url, backend=backend)
+        html, used_backend = await fetch_page(url, backend=backend)
+        page_suffix = "md" if used_backend == "firecrawl" else "html"
         print(f"📥 Pagina scaricata — forzato re-scrape ({len(html):,} caratteri)")
 
     # --- Parse ---
@@ -98,7 +110,7 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
         url_normalized=normalized,
         url_hash=url_hash,
         scraped_at=now,
-        dest_label=params.get("dest_id", ""),
+        dest_label=extract_dest_label(url, html),
         checkin=params["checkin"],
         checkout=params["checkout"],
         adults=params["adults"],
@@ -108,7 +120,7 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
     )
 
     # --- Save ---
-    json_path = save_result(result, html)
+    json_path = save_result(result, html, page_suffix=page_suffix)
     print(f"💾 Salvato in {json_path}")
     print_summary(result)
 
