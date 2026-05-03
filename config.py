@@ -21,6 +21,16 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 2
 
+# Booking.com internal GraphQL (search results HTML bootstrap → POST /dml/graphql)
+BOOKING_GRAPHQL_ENDPOINT = "https://www.booking.com/dml/graphql"
+BOOKING_GRAPHQL_IMPERSONATE = "chrome131"
+
+# Optional path to JSON POST body template when HTML extraction fails (same shape as browser POST).
+BOOKING_GRAPHQL_PAYLOAD_PATH_ENV = "BOOKING_GRAPHQL_PAYLOAD_PATH"
+
+# Stored page.json envelope marker consumed by parser.parse_hotels
+GRAPHQL_ENVELOPE_FORMAT = "__BOOKING_SCRAPER_GRAPHQL_V1__"
+
 # URL normalization: only keep these params for deduplication
 # (tracking params like label, sid, aid are stripped)
 KEEP_PARAMS = {

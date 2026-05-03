@@ -69,8 +69,8 @@ def is_visited(url_hash: str) -> bool:
 
 def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html") -> str:
     """
-    Save raw page (HTML or markdown) and JSON for a scrape result.
-    page_suffix: "html" for httpx HTML, "md" for Firecrawl markdown.
+    Save raw page (HTML, markdown, or GraphQL JSON envelope) and JSON for a scrape result.
+    page_suffix: "html" (httpx), "md" (Firecrawl), or "graphql" envelope as "json".
     Returns the path to the JSON file.
     """
     result_dir = RESULTS_DIR / result.url_hash
@@ -78,6 +78,8 @@ def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html
 
     if page_suffix == "md":
         raw_path = result_dir / "page.md"
+    elif page_suffix == "json":
+        raw_path = result_dir / "page.json"
     else:
         raw_path = result_dir / "page.html"
 
@@ -115,10 +117,10 @@ def save_result(result: ScrapeResult, raw_content: str, page_suffix: str = "html
 def load_stored_page(url_hash: str) -> tuple[str, str] | None:
     """
     Load saved raw page for re-parsing.
-    Returns (content, page_suffix) with page_suffix "html" or "md", or None.
+    Returns (content, page_suffix) with page_suffix "json", "html", or "md", or None.
     """
     result_dir = RESULTS_DIR / url_hash
-    for name, suffix in (("page.html", "html"), ("page.md", "md")):
+    for name, suffix in (("page.json", "json"), ("page.html", "html"), ("page.md", "md")):
         path = result_dir / name
         if path.exists():
             return path.read_text(encoding="utf-8"), suffix

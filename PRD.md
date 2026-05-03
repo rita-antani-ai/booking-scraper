@@ -1,7 +1,7 @@
 # Product Requirements Document: booking-scraper
 
-**Document version:** 1.0  
-**Last updated:** 2026-05-02  
+**Document version:** 1.1  
+**Last updated:** 2026-05-03  
 **Scope:** Describes the shipped behavior of this repository’s Python codebase (`scraper.py` entrypoint and supporting modules).
 
 ---
@@ -10,20 +10,24 @@
 
 ### 1.1 What the product does
 
-**booking-scraper** is a command-line utility that downloads a Booking.com search-results page for a given URL, parses hotel listings into structured records, persists the raw page and JSON output on disk, and maintains a local index for deduplication and quick redisplay of prior searches.
+**booking-scraper** is a command-line utility that downloads Booking.com search-results content for a given URL, parses hotel listings into structured records, persists the raw artifact and JSON output on disk, and maintains a local index for deduplication and quick redisplay of prior searches.
 
 Primary capabilities:
 
-1. **Fetch** a search-results URL from Booking.com hosts using configurable backends (direct HTTP or Firecrawl API).
-2. **Parse** hotel cards from raw HTML or from markdown-derived text using regex-based heuristics tuned to common Booking layouts.
+1. **Fetch** a search-results URL from Booking.com hosts using configurable backends (direct HTTP, Firecrawl API, or internal **FullSearch GraphQL** over `/dml/graphql`).
+2. **Parse** hotel cards from raw HTML/markdown **or** from merged GraphQL JSON payloads into the same `Hotel` schema.
 3. **Store** immutable artifacts under `output/results/<url_hash>/` and update `output/index.json`.
 4. **Avoid redundant scraping** when the normalized URL was already scraped, unless overridden.
 5. **Re-parse** stored pages without issuing new HTTP requests.
 
+### GraphQL backend (pagination)
+
+When `--backend graphql` is selected, the tool performs an initial **GET** of the search-results URL using **curl_cffi** with TLS impersonation (Chrome-aligned fingerprint) so session cookies are established. It extracts the browser-style **FullSearch** POST JSON body from the HTML (or loads it from **`BOOKING_GRAPHQL_PAYLOAD_PATH`** if embedding cannot be parsed). It then **POST**s to `https://www.booking.com/dml/graphql` repeatedly with `variables.input.pagination.offset` stepped by `rowsPerPage` (typically `25`) until a response returns fewer than `rowsPerPage` hotels. All pages are merged into one deduplicated hotel list and persisted as a **`page.json`** envelope alongside `hotels.json`.
+
 ### 1.2 Target user
 
 - **Individuals** (travel planning, researchers, analysts) comfortable with CLI and Python who want **offline snapshots** of search results and structured hotel fields for spreadsheets or scripts.
-- **Power users / developers** who can supply a Firecrawl API key when Booking.com serves bot challenges instead of listings.
+- **Power users / developers** who can supply a Firecrawl API key when Booking.com serves bot challenges instead of listings, **or** run **`--backend graphql`** (`curl-cffi`) when HTML scraping hits WAF/challenge screens.
 
 There is **no hosted service**, **no multi-tenant UX**, and **no GUI** beyond terminal output.
 
@@ -34,7 +38,8 @@ There is **no hosted service**, **no multi-tenant UX**, and **no GUI** beyond te
 | **Repeatable archiving** | Normalized URLs + deterministic hash → stable folder per logical search |
 | **Cost-aware re-scrapes** | Skip fetch if already scraped; `--reparse` reuses saved HTML/markdown |
 | **Supplier-friendly parsing** | Firecrawl markdown path aligns with parsers expecting Firecrawl-style headings |
-| **Transparent debugging** | Full page persisted (`page.html` or `page.md`) when parsing yields zero hotels |
+| **Bypass HTML-only gates** | GraphQL backend bootstraps cookies + impersonates Chrome TLS toward `/dml/graphql` |
+| **Transparent debugging** | Full artifact persisted (`page.html`, `page.md`, or **`page.json`** envelope) when parsing yields zero hotels |
 
 ---
 
@@ -46,14 +51,15 @@ There is **no hosted service**, **no multi-tenant UX**, and **no GUI** beyond te
 |----|------|----------------------|
 | G1 | Persist a scrape for every distinct normalized search URL | Exactly one folder per SHA-256-derived 12-character hash appears under `output/results/` |
 | G2 | Make re-scrapes optional | On cache hit without `--force`, `fetch_page` runs only after the user confirms overwrite (`s`/`si`); answering `n`/`no` exits without fetch. `--force` always fetches and skips the prompt. |
-| G3 | Support both raw HTML and Firecrawl markdown | Successful parse produces non-empty `hotels[]` where page structure matches assumptions |
+| G3 | Support raw HTML, Firecrawl markdown, and merged GraphQL payloads | Successful parse produces non-empty `hotels[]` where payloads match assumptions |
 | G4 | Operate reliably on constrained networks | `httpx`: configurable timeout (`30`s) and retries (`MAX_RETRIES = 2` → up to `3` attempts) |
+| G5 | Multi-page listing completeness for GraphQL searches | GraphQL fetch merges every offset batch until short page (< `rowsPerPage`) |
 
 ### 2.2 Non-goals (current release)
 
 - Real-time pricing guarantees, availability, or booking execution.
 - Compliance review with Booking.com terms of service (operators must self-assess).
-- Pagination across multiple results pages beyond the single fetched URL document.
+- Automatic pagination for **httpx** / **Firecrawl** backends (still one downloaded document per run). **`graphql`** paginates internally via GraphQL offsets until exhaustion.
 
 ---
 
@@ -68,12 +74,13 @@ There is **no hosted service**, **no multi-tenant UX**, and **no GUI** beyond te
 | US3 | **As a** user improving the parser, **I want** to re-run extraction on saved HTML/markdown **so that** I do not re-hit Booking.com. |
 | US4 | **As a** user behind anti-bot defenses, **I want** Firecrawl as a backend **so that** I receive real listing content instead of a challenge page. |
 | US5 | **As a** user with many archived searches, **I want** `--list` to show prior runs **so that** I can find hashes and metadata quickly. |
+| US8 | **As a** user blocked by Booking HTML challenges, **I want** the GraphQL backend **so that** listings load via `/dml/graphql` with cookie bootstrap + pagination. |
 
 ### 3.2 Operational stories
 
 | ID | User story |
 |----|-------------|
-| US6 | **As a** developer, **I want** explicit `--backend httpx \| firecrawl \| auto` **so that** I control cost vs reliability. |
+| US6 | **As a** developer, **I want** explicit `--backend httpx \| firecrawl \| graphql \| auto` **so that** I control transport vs cost vs resilience. |
 | US7 | **As a** user whose JSON was corrupted, **I want** `--force` **so that** I can overwrite artifacts for the same normalized search. |
 
 ---
@@ -121,19 +128,21 @@ Requirement: Produce a human-readable destination when possible.
 
 | ID | Requirement | Acceptance criteria |
 |----|-------------|---------------------|
-| F4 | **auto backend** | If `FIRECRAWL_API_KEY` env is non-empty (after strip): use Firecrawl; else `httpx`. |
+| F4 | **auto backend** | If `FIRECRAWL_API_KEY` env is non-empty (after strip): use Firecrawl; else `httpx`. **`auto` never selects `graphql`.** |
 | F5 | **httpx** | Async GET with browser-like UA, Accept headers, Referer Google, redirects followed, raises after `MAX_RETRIES + 1` failed attempts wrapping last error in `RuntimeError`. |
 | F6 | **Firecrawl** | `POST https://api.firecrawl.dev/v1/scrape` JSON body `formats: ["markdown"]`, `waitFor: 5000` ms; Bearer token from env; raises if `success` false or missing `data.markdown`. |
+| F7 | **graphql** | Sync **`curl_cffi`** session: GET search URL with impersonation (`config.BOOKING_GRAPHQL_IMPERSONATE`, default Chrome-aligned); extract POST JSON with `"operationName":"FullSearch"` from HTML via brace-balanced JSON slice **or** load identical JSON object from path in **`BOOKING_GRAPHQL_PAYLOAD_PATH`** env; POST `Content-Type`/`Accept` `application/json` to `config.BOOKING_GRAPHQL_ENDPOINT`; set **`variables.input.pagination.offset`** to `0`, `rowsPerPage`, `2*rowsPerPage`, … until **`count_hotels_in_graphql_response(response) < rowsPerPage`** or safety cap (`offset` ≥ `10000`). Merge responses into envelope (`format` = `GRAPHQL_ENVELOPE_FORMAT`), storing bootstrap HTML under **`page_html`**. |
 
-Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs file suffix (`md` vs `html`).
+Returned tuple from `fetch_page`: `(content, "firecrawl" \| "httpx" \| "graphql")` informs file suffix (`md` vs `html` vs **`json`**).
 
 ### 4.5 Parsing (`parser.parse_hotels`)
 
 | ID | Requirement | Acceptance criteria |
 |----|-------------|---------------------|
-| F7 | **Input flexibility** | If content looks like HTML (DOCTYPE/HTML near start up to heuristic window), strip tags via custom `HTMLParser` (block elements → newlines; skip script/style/noscript) before regex passes. |
-| F8 | **Hotel segmentation** | New hotel starts when a line matches `### [Name\` markdown pattern (`re.search`) capturing name before `\`. |
-| F9 | **Fields extracted** per hotel via regex / contains | See §7 Data Model for field semantics. Includes English and Italian locality suffixes (`Show on map` / `Mostra su mappa`), multiple rating wording patterns, `[See availability](https://www.booking.com/...)` link capture. |
+| F8 | **Input flexibility** | If content looks like HTML (DOCTYPE/HTML near start up to heuristic window), strip tags via custom `HTMLParser` (block elements → newlines; skip script/style/noscript) before regex passes. |
+| F9 | **GraphQL envelope** | If UTF-8 text parses as JSON object with `format == GRAPHQL_ENVELOPE_FORMAT`, build hotels via **`parse_hotels_from_graphql_responses`** over **`responses[]`** (dedupe by stable property id / URL / fallback fingerprint). |
+| F10 | **Hotel segmentation (HTML/md)** | New hotel starts when a line matches `### [Name\` markdown pattern (`re.search`) capturing name before `\`. |
+| F11 | **Fields extracted** per hotel via regex / contains | See §7 Data Model for field semantics. Includes English and Italian locality suffixes (`Show on map` / `Mostra su mappa`), multiple rating wording patterns, `[See availability](https://www.booking.com/...)` link capture. |
 
 **Known parser behaviors:**
 
@@ -141,15 +150,16 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
 - `price_per_night`: follows a line equal to `"Per night"` within next few lines matching currency-optional integers.
 - `total_price`: from `"Current price …"` discounted line OR `Price <amount>` line.
 - Boolean amenity flags via substring match: `"Free cancellation"`, `"No prepayment needed"` (English-only substrings).
+- GraphQL mapping uses defensive key paths (`basicPropertyData`, `displayName`, `priceDisplay`, `reviews`, `location`) and may omit fields when experiments change shapes.
 
 ### 4.6 Persistence (`storage`)
 
 | ID | Requirement | Acceptance criteria |
 |----|-------------|---------------------|
-| F10 | **Directory layout** | `OUTPUT_DIR/results/<hash>/` exists; raw file `page.html` or `page.md`; structured `hotels.json`. |
-| F11 | **Atomic index write** | `index.json` written via temp file in same folder + `os.replace`. |
-| F12 | **Index entries** | One object per hash key storing URL pair, scrape timestamp (ISO UTC from caller), extracted search metadata, counts, paths to artifacts **relative to project root**. |
-| F13 | **Load resilience** | Missing / invalid JSON index returns `{}`; corrupt lines do not crash load. |
+| F12 | **Directory layout** | `OUTPUT_DIR/results/<hash>/` exists; raw file `page.html`, `page.md`, or **`page.json`**; structured `hotels.json`. |
+| F13 | **Atomic index write** | `index.json` written via temp file in same folder + `os.replace`. |
+| F14 | **Index entries** | One object per hash key storing URL pair, scrape timestamp (ISO UTC from caller), extracted search metadata, counts, paths to artifacts **relative to project root**. |
+| F15 | **Load resilience** | Missing / invalid JSON index returns `{}`; corrupt lines do not crash load. |
 
 **Path note:** JSON inside `hotels.json` embeds **`result.html_file` / `result.json_file` as resolved absolute path strings at save time** (see §7)—whereas **`index.json` stores repo-relative paths** for portability.
 
@@ -157,11 +167,12 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
 
 | ID | Requirement | Acceptance criteria |
 |----|-------------|---------------------|
-| F14 | **Init** | Calls `init_storage()` → loads `.env` via python-dotenv, ensures `output/` trees exist. |
-| F15 | **No URL** without `--list` | Prints argparse help text and exits status `1`. |
-| F16 | **Cache hit path** | If not `force`, not `reparse`, entry exists for hash → load `hotels.json` via Pydantic and `print_summary` when the file exists; if JSON is missing, print indexed fields (scrape time, destinazione, `n_hotels`) plus warning. |
-| F17 | **Cache overwrite confirmation** | After summary (F16), `input()` prompts in Italian (“Questa ricerca è già stata effettuata il *[first 19 chars of ISO `scraped_at`]* … (s/n)”). Answers **`s`** / **`si`** → `fetch_page` then `save_result` (same **`url_hash`** / **`output/results/<hash>/`**). **`n`** / **`no`** → exit **`0`** without fetch—case-insensitive **after strip**; invalid replies re-prompt with a clarifying Italian line. **`--force` bypasses this prompt** (immediate fetch). |
-| F18 | **Reparse guard** | If `--reparse` and no saved page → error message referencing hash + exit gracefully (no traceback requirement). |
+| F16 | **Init** | Calls `init_storage()` → loads `.env` via python-dotenv, ensures `output/` trees exist. |
+| F17 | **No URL** without `--list` | Prints argparse help text and exits status `1`. |
+| F18 | **Cache hit path** | If not `force`, not `reparse`, entry exists for hash → load `hotels.json` via Pydantic and `print_summary` when the file exists; if JSON is missing, print indexed fields (scrape time, destinazione, `n_hotels`) plus warning. |
+| F19 | **Cache overwrite confirmation** | After summary (F18), `input()` prompts in Italian (“Questa ricerca è già stata effettuata il *[first 19 chars of ISO `scraped_at`]* … (s/n)”). Answers **`s`** / **`si`** → `fetch_page` then `save_result` (same **`url_hash`** / **`output/results/<hash>/`**). **`n`** / **`no`** → exit **`0`** without fetch—case-insensitive **after strip**; invalid replies re-prompt with a clarifying Italian line. **`--force` bypasses this prompt** (immediate fetch). |
+| F20 | **Reparse guard** | If `--reparse` and no saved page → error message referencing hash + exit gracefully (no traceback requirement). |
+| F21 | **Destination label with GraphQL** | When persist suffix is JSON envelope, pass **`page_html`** from envelope into **`extract_dest_label`** (fallback raw JSON string). |
 
 ### 4.8 Terminal summaries
 
@@ -182,6 +193,7 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
 |-------|------------------------|
 | Fetch latency | Dominated by network + Booking response; HTTP client timeout **30 seconds** (`REQUEST_TIMEOUT`). |
 | Firecrawl | Single POST, **60s** client-side timeout on scrape POST; **`waitFor: 5000` ms** server-side dwell in payload. |
+| GraphQL | One bootstrap GET plus **N** FullSearch POSTs (`REQUEST_TIMEOUT` each); **N ≈ ⌈hotel_count / rowsPerPage⌉**, capped by offset safety rail. |
 | Parsing | Linear in document size string operations; regex over line-split content—suitable for single-page search results DOM/markdown snapshots. |
 
 ### 5.2 Security
@@ -222,10 +234,10 @@ Returned tuple from `fetch_page`: `(content, "firecrawl" | "httpx")` informs fil
        │             └─────────────┘     └──────▲──────┘
        │                                      │
        ├────────────► fetcher ────────────────┤
-       │              (httpx/firecrawl)       │
+       │              (httpx / firecrawl / graphql+curl_cffi)
        │                                      │
        ├────────────► parser ──────────────────┘
-       │              (regex/HTML→text)
+       │              (regex/HTML→text + GraphQL card mapper)
        │
        ├────────────► storage ───► filesystem (results + index)
        │
@@ -258,8 +270,8 @@ flowchart LR
 | Module | Imports |
 |--------|---------|
 | `scraper.py` | `asyncio`, `argparse`, `datetime`, `url_utils`, `fetcher`, `parser`, `config`, `storage`, `models` |
-| `fetcher.py` | `httpx`, `urllib.parse`, `config` constants |
-| `parser.py` | `re`, `html.parser.HTMLParser`, `models.Hotel` |
+| `fetcher.py` | `httpx`, `urllib.parse`, `curl_cffi` (graphql only), `copy`, `json`, `config`, **`parser`** (counts hotels per GraphQL page) |
+| `parser.py` | `re`, `html.parser.HTMLParser`, `models.Hotel`, **`config.GRAPHQL_ENVELOPE_FORMAT`** |
 | `storage.py` | `json`, `os`, `tempfile`, `pathlib`, `config`, `models.ScrapeResult` |
 | `url_utils.py` | `hashlib`, `re`, `html.unescape`, `urllib.parse`, `config.KEEP_PARAMS` |
 | `config.py` | `pathlib`, `dotenv.load_dotenv` |
@@ -299,7 +311,7 @@ Strings are intentional (no enforced currency normalization beyond stripping com
 | `adults`, `children` | `int` | Party composition |
 | `n_hotels` | `int` | `len(hotels)` at save |
 | `hotels` | `list[Hotel]` | Parsed listings |
-| `html_file` | `str` | Absolute path written to `"page"` file at save (**field name heritage: may be `.md`**). |
+| `html_file` | `str` | Absolute path written to `"page"` file at save (**field name heritage: may be `.md` or `.json` envelope**). |
 | `json_file` | `str` | Absolute path of `hotels.json` |
 
 **Serialization:** `model_dump_json(indent=2)` with UTF-8 file write (`ensure_ascii` false at index level).
@@ -352,8 +364,8 @@ Shell quoting requirement: Operators must quote URLs containing shell metacharac
 | Flag | Values | Default | Effect |
 |------|--------|---------|--------|
 | `--force` | boolean | False | Bypass cache overwrite **`input()`** prompt and visit cache → always fetch (unless `--reparse` path). Overwrites artifact directory contents for that hash (`write_text` replacements). |
-| `--reparse` | boolean | False | Loads stored `page.html` or `page.md` via hash computed from normalized input URL → parse only; errors if absent. `--force` not required to refresh JSON from stale HTML manually if cache miss logic bypassed—not combined with initial visit skip except user supplies matching URL hash content. *(Product behavior: skips fetch entirely.)* |
-| `--backend` | `auto`, `httpx`, `firecrawl` | `auto` | Select fetch implementation; **`auto`** keys off presence of **`FIRECRAWL_API_KEY`**. Ignored during `--reparse`. |
+| `--reparse` | boolean | False | Loads stored **`page.json`**, `page.html`, or `page.md`** (first match in that order) via hash computed from normalized input URL → parse only; errors if absent. *(Skips HTTP entirely.)* |
+| `--backend` | `auto`, `httpx`, `firecrawl`, **`graphql`** | `auto` | Select fetch implementation; **`auto`** prefers Firecrawl when **`FIRECRAWL_API_KEY`** is set—**never auto-selects `graphql`**. Ignored during `--reparse`. |
 | `--list` | boolean | False | Print index table sorted by scrape time descending; **`url` not required.** |
 
 Mutually nuanced flows:
@@ -377,7 +389,7 @@ Non-zero exits on networking / Firecrawl / validation errors propagate as except
 
 | File | Format | Encoding |
 |------|--------|----------|
-| `page.html` / `page.md` | Raw document | UTF-8 text (`write_text`) |
+| `page.html` / `page.md` / **`page.json`** | Raw document (**JSON envelope** for GraphQL backend) | UTF-8 text (`write_text`) |
 | `hotels.json` | JSON (indented 2 spaces) | UTF-8 |
 
 No CSV, parquet, or XML export is implemented.
@@ -387,6 +399,7 @@ No CSV, parquet, or XML export is implemented.
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `FIRECRAWL_API_KEY` | Optional but necessary for reliable Firecrawl path | Bearer token for API |
+| **`BOOKING_GRAPHQL_PAYLOAD_PATH`** | Optional fallback when HTML lacks embedded FullSearch POST JSON | Filesystem path to captured POST body JSON (`operationName`: **FullSearch**) |
 
 **.env loading:** automatic via `load_dotenv()` during `init_storage()`.
 
@@ -401,6 +414,8 @@ No CSV, parquet, or XML export is implemented.
 | `httpx` | `>= 0.27` | Async HTTP client; Firecrawl POST |
 | `pydantic` | `>= 2.0` | `BaseModel`, JSON IO |
 | `python-dotenv` | `>= 1.0` | `.env` load |
+| **`curl-cffi`** | **`>= 0.7`** | **TLS impersonation client for GraphQL backend GET/POST** |
+| **`pytest`** | **`>= 8`** | **Unit tests (`pytest.ini` sets `pythonpath = .`)** |
 
 ### 9.2 Firecrawl API
 
@@ -420,9 +435,17 @@ No CSV, parquet, or XML export is implemented.
 
 **Assumed success envelope:** `{ "success": true, "data": { "markdown": "..." } }`. Any deviation yields `RuntimeError` with truncated diagnostic string.
 
-### 9.3 Booking.com structural assumptions
+### 9.3 Booking.com FullSearch GraphQL (graphql backend)
 
-The parser implicitly assumes textual patterns derived from Booking’s search UI when rendered:
+**Endpoint:** `POST https://www.booking.com/dml/graphql`
+
+**Bootstrap:** Browser-equivalent **GET** of the search-results URL establishes cookies required by Booking edge/WAF stacks.
+
+**POST body:** JSON matching embedded **`operationName` = `FullSearch`**, including **`variables.input.pagination`** (`offset`, implicit **`rowsPerPage`** on sibling **`input`** keys depending on captured payload shape).
+
+**TLS fingerprint:** Implemented via **`curl_cffi`** impersonation (`BOOKING_GRAPHQL_IMPERSONATE`, default **`chrome131`**).
+
+### 9.4 Booking.com structural assumptions (HTML / markdown parsers)
 
 - Listing titles surfaced as Markdown `### [Name …` fragments (Firecrawl path) OR equivalent line structure after HTML→text stripping.
 - Map call-to-action snippets adjacent to locality text.
@@ -430,7 +453,11 @@ The parser implicitly assumes textual patterns derived from Booking’s search U
 - Price presentation including `"Per night"` sentinel line and `$`/`€`/£/`¥`-tolerant numeric lines.
 - “See availability” deep links on `booking.com` domain.
 
-Booking may **A/B test markup**, localize strings beyond covered patterns, paginate infinite scroll listings (only captured content is what's in downloaded document), inject CAPTCHAs, or change headings—breaking parsing without code updates.
+Booking may **A/B test markup**, localize strings beyond covered patterns, paginate infinite scroll listings for HTML snapshots (only captured content is what's in that single downloaded document unless **`graphql`** merges pages server-side), inject CAPTCHAs, or change headings—breaking parsing without code updates.
+
+### 9.5 Booking.com structural assumptions (GraphQL cards)
+
+FullSearch **`searchResults`** item shapes evolve frequently. The mapper prefers **`basicPropertyData`**, **`displayName`**, **`location.displayLocation`**, **`reviews.score`**, **`priceDisplay`**, optional **`blocks`** room skeletons, and Booking URLs derived from **`pageName`**. Missing subtrees degrade gracefully to empty strings / false flags.
 
 ---
 
@@ -440,9 +467,10 @@ Booking may **A/B test markup**, localize strings beyond covered patterns, pagin
 |---------|-------------|
 | **Legal / ToS** | Scraping may conflict with Booking.com terms; automated access risk is entirely on operator. |
 | **Single-seat** | Filesystem concurrency not designed for parallel writes without external coordination. |
-| **No automated tests** | Repository contains **no pytest/unittest suites** enforcing regressions—validation is manual. |
-| **Regex fragility** | Parser is heuristic; locales not fully enumerated; `"dest_label"` can degrade to opaque IDs (`dest_id`). |
-| **Single page capture** | No iterator for `"next page"` URLs—only explicitly provided search URL downloaded. |
+| **Regression coverage** | `pytest` covers GraphQL pagination merge, envelope parsing, and HTML-embedded FullSearch extraction (`tests/`); HTML/Firecrawl layouts lack broad golden fixtures. |
+| **Regex fragility** | Markdown/HTML parser is heuristic; locales not fully enumerated; `"dest_label"` can degrade to opaque IDs (`dest_id`). |
+| **Single-document capture** | **httpx / Firecrawl** download only the URL passed on the CLI—no automatic multi-page HTML crawling. **`graphql`** merges multiple FullSearch offsets server-side until exhaustion (still one logical search identity). |
+| **GraphQL drift** | Embedded POST JSON extraction + card shapes depend on Booking internals; failures may require refreshing **`BOOKING_GRAPHQL_PAYLOAD_PATH`** captures or mapper updates. |
 | **Field completeness** | Some hotels may miss optional fields (`label`, prices) depending on snippet presence. |
 | **Language mix** | Output tables Italian; parsing patterns English-heavy with partial Italian locality token. |
 | **httpx path** | High likelihood of CAPTCHA / anti-bot gate—README acknowledges operational reality. |
@@ -456,10 +484,10 @@ Prioritized enhancements **not implemented** today:
 
 | Theme | Potential work |
 |-------|----------------|
-| Quality | Automated tests (fixture HTML/markdown golden files); CI pipeline |
+| Quality | Expand pytest fixtures (HTML/markdown golden files); CI pipeline |
 | Parsing | Localization matrix; DOM-selectors fallback (BeautifulSoup) parallel to regex |
 | Data | Persist to SQLite/DuckDB; schema migrations; nightly diff jobs |
-| Product | Pagination helper (derive `offset` URLs responsibly), multi-city batch config file |
+| Product | Multi-city batch config file; richer GraphQL persisted-query/version pinning |
 | Multi-site | Abstraction layers for Airbnb, Hotels.com—with separate parsers & legal review |
 | UX | Structured logging (JSON), `--quiet/--json` machine-readable CLI |
 | Robustness | Exponential backoff, respectful rate limiting, Retry-After support |
@@ -474,8 +502,8 @@ Prioritized enhancements **not implemented** today:
 | **Normalized URL** | Booking URL with irrelevant tracking query params removed and kept params serialized consistently; basis for equality & dedupe. |
 | **URL hash** | 12 hexadecimal character prefix of SHA-256(normalized URL); directory name under `results/`. |
 | **Firecrawl** | External hosted scrape/rendering API (`api.firecrawl.dev`) used to obtain markdown snapshots of Booking pages. |
-| **Backend** | Transport strategy retrieving page bytes/markdown (`httpx`, `firecrawl`, `auto`). |
-| **Re-parse** | Re-run `parse_hotels` on previously stored `page.(html|md)` without fetching. |
+| **Backend** | Transport strategy retrieving listing bytes (`httpx`, `firecrawl`, **`graphql`**, **`auto`**). |
+| **Re-parse** | Re-run `parse_hotels` on previously stored **`page.json`** / `page.html` / `page.md` without fetching. |
 | **Index** | `output/index.json` manifest mapping hashes → metadata pointers. |
 | **Hotel card** | Contiguous textual block representing one property in listings—parser state machine delineated by headings & patterns. |
 | **CAPTCHA / challenge page** | Bot interstitial HTML lacking listing patterns—parses yield zero hotels. |
@@ -488,10 +516,10 @@ Prioritized enhancements **not implemented** today:
 
 | File | Responsibility summary |
 |------|-------------------------|
-| `config.py` | Paths, HTTP constants, `KEEP_PARAMS`, `init_storage()` |
+| `config.py` | Paths, HTTP constants, **`KEEP_PARAMS`**, GraphQL endpoint/impersonation/env keys, GraphQL envelope marker, `init_storage()` |
 | `url_utils.py` | URL canonicalization & hashing & metadata extraction |
-| `fetcher.py` | Booking-only HTTP fetch backends |
-| `parser.py` | HTML/text normalization & regex extraction pipeline |
+| `fetcher.py` | Booking-only fetch backends (**httpx**, **Firecrawl**, **`graphql` via curl_cffi**) |
+| `parser.py` | HTML/markdown regex pipeline **plus GraphQL card → `Hotel` mapping** |
 | `models.py` | `Hotel`, `ScrapeResult` schemas |
 | `storage.py` | Persistence + atomic index merges + path resolution helpers |
 | `scraper.py` | CLI argparse + asyncio orchestration |
@@ -500,4 +528,4 @@ Prioritized enhancements **not implemented** today:
 
 ## Appendix B: Change control
 
-Updates to **`KEEP_PARAMS`**, **`parse_hotels` patterns**, **Firecrawl payload**, or **CLI contract** constitute **feature changes** affecting dedupe fidelity and reproducibility operators depend on—the PRD should be revised accordingly.
+Updates to **`KEEP_PARAMS`**, **`parse_hotels` patterns**, **Firecrawl payload**, **`graphql` extractor/mapper**, or **CLI contract** constitute **feature changes** affecting dedupe fidelity and reproducibility operators depend on—the PRD should be revised accordingly.

@@ -4,6 +4,7 @@ booking-scraper: Scrape Booking.com search results and save them locally.
 
 Usage:
     python scraper.py <booking_url>           # Scrape and save
+    python scraper.py <booking_url> --backend graphql  # FullSearch GraphQL + pagination
     python scraper.py <booking_url> --force   # Re-scrape even if visited
     python scraper.py <booking_url> --reparse # Re-parse from saved HTML (no fetch)
     python scraper.py --list                  # Show all visited searches
@@ -11,6 +12,7 @@ Usage:
 
 import asyncio
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 
@@ -120,7 +122,12 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
 
     if not reparse:
         html, used_backend = await fetch_page(url, backend=backend)
-        page_suffix = "md" if used_backend == "firecrawl" else "html"
+        if used_backend == "firecrawl":
+            page_suffix = "md"
+        elif used_backend == "graphql":
+            page_suffix = "json"
+        else:
+            page_suffix = "html"
         if force:
             print(f"📥 Pagina scaricata — forzato re-scrape ({len(html):,} caratteri)")
         else:
@@ -134,13 +141,22 @@ async def scrape(url: str, force: bool = False, reparse: bool = False, backend: 
         print("⚠️  Nessun hotel trovato. La pagina potrebbe essere un CAPTCHA o una pagina vuota.")
         print("   Controlla l'HTML salvato per debugare.")
 
+    label_src = html
+    if page_suffix == "json":
+        try:
+            env = json.loads(html)
+            if isinstance(env, dict):
+                label_src = env.get("page_html", html)
+        except json.JSONDecodeError:
+            pass
+
     # --- Build result ---
     result = ScrapeResult(
         url=url,
         url_normalized=normalized,
         url_hash=url_hash,
         scraped_at=now,
-        dest_label=extract_dest_label(url, html),
+        dest_label=extract_dest_label(url, label_src),
         checkin=params["checkin"],
         checkout=params["checkout"],
         adults=params["adults"],
@@ -163,8 +179,8 @@ def main():
     parser.add_argument("url", nargs="?", help="Booking.com search URL")
     parser.add_argument("--force", action="store_true", help="Re-scrape even if already visited")
     parser.add_argument("--reparse", action="store_true", help="Re-parse from saved HTML (no fetch)")
-    parser.add_argument("--backend", choices=["auto", "httpx", "firecrawl"], default="auto",
-                        help="Fetch backend (default: auto — uses firecrawl if key exists)")
+    parser.add_argument("--backend", choices=["auto", "httpx", "firecrawl", "graphql"], default="auto",
+                        help="Fetch backend (default: auto — firecrawl if key exists; never graphql)")
     parser.add_argument("--list", action="store_true", help="List all visited searches")
 
     args = parser.parse_args()

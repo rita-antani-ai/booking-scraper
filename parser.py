@@ -10,6 +10,7 @@ import re
 from html.parser import HTMLParser
 
 from models import Hotel
+from config import GRAPHQL_ENVELOPE_FORMAT
 
 # Decimal degrees (optional leading minus, at least one digit before optional fraction)
 _COORD_FLOAT = r"-?\d{1,3}(?:\.\d+)?"
@@ -435,13 +436,305 @@ def _html_to_text(html: str) -> str:
     return parser.get_text()
 
 
+def _looks_like_graphql_hotel_card(d: dict) -> bool:
+    """Heuristic: Booking FullSearch cards usually expose basicPropertyData or displayName + commerce fields."""
+    if not isinstance(d, dict):
+        return False
+    bpd = d.get("basicPropertyData")
+    if isinstance(bpd, dict) and (bpd.get("id") is not None or bpd.get("name")):
+        return True
+    if d.get("displayName") is not None and (
+        "priceDisplay" in d or "reviews" in d or "location" in d
+    ):
+        return True
+    return False
+
+
+def iter_graphql_search_result_cards(obj) -> object:
+    """Yield hotel-shaped dicts nested under any searchResults list in a GraphQL JSON tree."""
+    if isinstance(obj, dict):
+        sr = obj.get("searchResults")
+        if isinstance(sr, list):
+            for item in sr:
+                if isinstance(item, dict) and _looks_like_graphql_hotel_card(item):
+                    yield item
+        for v in obj.values():
+            yield from iter_graphql_search_result_cards(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from iter_graphql_search_result_cards(item)
+
+
+def count_hotels_in_graphql_response(resp: dict) -> int:
+    """Count FullSearch hotel cards in one GraphQL JSON response dict."""
+    if not isinstance(resp, dict):
+        return 0
+    return sum(1 for _ in iter_graphql_search_result_cards(resp))
+
+
+def _graphql_display_name(card: dict) -> str:
+    dn = card.get("displayName")
+    if isinstance(dn, dict):
+        for key in ("text", "plainText", "title"):
+            v = dn.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    elif isinstance(dn, str) and dn.strip():
+        return dn.strip()
+    bpd = card.get("basicPropertyData") if isinstance(card.get("basicPropertyData"), dict) else {}
+    for key in ("name", "propertyName", "plainName"):
+        v = bpd.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _graphql_booking_link(card: dict) -> str:
+    for key in ("shareUrl", "propertyUrl", "landingURL", "landingUrl"):
+        u = card.get(key)
+        if isinstance(u, str) and "booking.com" in u:
+            return u
+    urls = card.get("urls")
+    if isinstance(urls, dict):
+        for u in urls.values():
+            if isinstance(u, str) and "booking.com" in u:
+                return u
+    bpd = card.get("basicPropertyData") if isinstance(card.get("basicPropertyData"), dict) else {}
+    for key in ("url", "propertyUrl"):
+        u = bpd.get(key)
+        if isinstance(u, str) and "booking.com" in u:
+            return u
+    page_name = bpd.get("pageName")
+    if isinstance(page_name, str) and page_name.strip():
+        return f"https://www.booking.com/hotel/{page_name.strip()}.html"
+    return ""
+
+
+def _graphql_stable_hotel_id(card: dict) -> str:
+    bpd = card.get("basicPropertyData") if isinstance(card.get("basicPropertyData"), dict) else {}
+    hid = bpd.get("id")
+    if hid is not None:
+        return f"id:{hid}"
+    ufi = bpd.get("ufi")
+    slug = (bpd.get("pageName") or bpd.get("slug") or "").strip()
+    if ufi is not None and slug:
+        return f"ufi:{ufi}:{slug}"
+    link = _graphql_booking_link(card)
+    if link:
+        return f"url:{link}"
+    name = _graphql_display_name(card)
+    loc_obj = card.get("location") if isinstance(card.get("location"), dict) else {}
+    loc = loc_obj.get("displayLocation") if isinstance(loc_obj.get("displayLocation"), str) else ""
+    return f"fallback:{name}|{loc}"
+
+
+def _graphql_coord_pair(card: dict) -> tuple[str, str]:
+    bpd = card.get("basicPropertyData") if isinstance(card.get("basicPropertyData"), dict) else {}
+    lat_keys = ("latitude", "lat")
+    lng_keys = ("longitude", "lng", "lon")
+    flat = lng = None
+    for lk in lat_keys:
+        v = bpd.get(lk)
+        if isinstance(v, (int, float)):
+            flat = float(v)
+            break
+        if isinstance(v, str):
+            flat = _parse_coord_number(v)
+            break
+    for lk in lng_keys:
+        v = bpd.get(lk)
+        if isinstance(v, (int, float)):
+            lng = float(v)
+            break
+        if isinstance(v, str):
+            lng = _parse_coord_number(v)
+            break
+    loc = card.get("location") if isinstance(card.get("location"), dict) else {}
+    if flat is None or lng is None:
+        geo = loc.get("geo") if isinstance(loc.get("geo"), dict) else {}
+        if flat is None:
+            for lk in lat_keys:
+                v = geo.get(lk) or loc.get(lk)
+                if isinstance(v, (int, float)):
+                    flat = float(v)
+                    break
+                if isinstance(v, str):
+                    flat = _parse_coord_number(v)
+                    break
+        if lng is None:
+            for lk in lng_keys:
+                v = geo.get(lk) or loc.get(lk)
+                if isinstance(v, (int, float)):
+                    lng = float(v)
+                    break
+                if isinstance(v, str):
+                    lng = _parse_coord_number(v)
+                    break
+    la_s = lo_s = ""
+    if flat is not None and lng is not None and _is_valid_pair(flat, lng):
+        la_s = _format_coord_str(flat)
+        lo_s = _format_coord_str(lng)
+    return la_s, lo_s
+
+
+def _graphql_rating_and_reviews(card: dict) -> tuple[str, str]:
+    reviews = card.get("reviews") if isinstance(card.get("reviews"), dict) else {}
+    score = reviews.get("score")
+    rating_s = ""
+    if isinstance(score, dict):
+        for key in ("secondaryScore", "primaryScore", "value", "formatted"):
+            v = score.get(key)
+            if isinstance(v, str) and v.strip():
+                rating_s = v.strip().replace(",", ".")
+                break
+            if isinstance(v, (int, float)):
+                rating_s = str(v)
+                break
+    elif isinstance(score, (int, float)):
+        rating_s = str(score)
+    reviews_count = ""
+    cnt = reviews.get("count") if isinstance(reviews.get("count"), dict) else {}
+    if isinstance(cnt, dict):
+        v = cnt.get("formatted") or cnt.get("text")
+        if isinstance(v, str):
+            reviews_count = v.replace(",", "").strip()
+    rc = reviews.get("reviewsCount") if isinstance(reviews.get("reviewsCount"), dict) else {}
+    if isinstance(rc, dict):
+        v = rc.get("formatted") or rc.get("text")
+        if isinstance(v, str):
+            reviews_count = v.replace(",", "").strip()
+    return rating_s, reviews_count
+
+
+def _graphql_prices(card: dict) -> tuple[str, str]:
+    """Return (price_per_night-ish, total/strike bundle best-effort)."""
+    pd = card.get("priceDisplay") if isinstance(card.get("priceDisplay"), dict) else {}
+
+    def _fmt_money_blob(blob: dict | None) -> str:
+        if not isinstance(blob, dict):
+            return ""
+        amt = blob.get("chargeAmount") if isinstance(blob.get("chargeAmount"), dict) else {}
+        if isinstance(amt, dict):
+            raw = amt.get("formatted") or amt.get("plainText")
+            if isinstance(raw, str):
+                return raw
+        disp = blob.get("displayAmount") if isinstance(blob.get("displayAmount"), dict) else {}
+        if isinstance(disp, dict):
+            raw = disp.get("formatted") or disp.get("plainText")
+            if isinstance(raw, str):
+                return raw
+        return ""
+
+    per_night = _fmt_money_blob(pd.get("priceBeforeDiscount") or pd.get("displayPrice"))
+    if not per_night:
+        per_night = _fmt_money_blob(pd.get("leadingCaption"))
+    total = _fmt_money_blob(pd.get("totalPrice") or pd.get("displayPrice"))
+
+    def _digits(s: str) -> str:
+        m = re.search(r"(\d[\d\s,]*)", s)
+        if not m:
+            return ""
+        return re.sub(r"\D", "", m.group(1))
+
+    return _digits(per_night), _digits(total)
+
+
+def _graphql_room_hint(card: dict) -> str:
+    blocks = card.get("blocks") if isinstance(card.get("blocks"), list) else []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("__typename") == "SearchResultsRoomSkeleton":
+            rm = b.get("roomInformation") if isinstance(b.get("roomInformation"), dict) else {}
+            name = rm.get("roomName") or rm.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return ""
+
+
+def _graphql_flags(card: dict) -> tuple[bool, bool]:
+    text_blob = json.dumps(card, ensure_ascii=False)
+    free_cancel = "free cancellation" in text_blob.lower()
+    no_prepay = "no prepayment" in text_blob.lower() or "pay at the property" in text_blob.lower()
+    pol = card.get("cancellationPolicies") if isinstance(card.get("cancellationPolicies"), dict) else {}
+    if pol.get("freeCancellation") is True:
+        free_cancel = True
+    return free_cancel, no_prepay
+
+
+def hotel_from_graphql_card(card: dict) -> Hotel:
+    """Map one FullSearch hotel-shaped GraphQL dict into Hotel."""
+    name = _graphql_display_name(card)
+    loc_obj = card.get("location") if isinstance(card.get("location"), dict) else {}
+    location = ""
+    if isinstance(loc_obj.get("displayLocation"), str):
+        location = loc_obj["displayLocation"].strip()
+    la, lo = _graphql_coord_pair(card)
+    rating, reviews = _graphql_rating_and_reviews(card)
+    ppn, total = _graphql_prices(card)
+    room = _graphql_room_hint(card)
+    free_c, no_prepay = _graphql_flags(card)
+    link = _graphql_booking_link(card)
+    label = ""
+    secondary = card.get("secondaryScore") if isinstance(card.get("secondaryScore"), dict) else {}
+    if isinstance(secondary.get("description"), str):
+        label = secondary["description"].strip()
+
+    return Hotel(
+        name=name,
+        location=location,
+        latitude=la,
+        longitude=lo,
+        rating=rating,
+        label=label,
+        reviews=reviews,
+        room=room,
+        price_per_night=ppn,
+        total_price=total,
+        free_cancellation=free_c,
+        no_prepayment=no_prepay,
+        link=link,
+    )
+
+
+def parse_hotels_from_graphql_responses(responses: list) -> list[Hotel]:
+    """Merge paginated FullSearch GraphQL responses into deduplicated Hotel rows."""
+    seen: set[str] = set()
+    out: list[Hotel] = []
+    if not isinstance(responses, list):
+        return out
+    for resp in responses:
+        if not isinstance(resp, dict):
+            continue
+        for card in iter_graphql_search_result_cards(resp):
+            hid = _graphql_stable_hotel_id(card)
+            if hid in seen:
+                continue
+            seen.add(hid)
+            out.append(hotel_from_graphql_card(card))
+    return out
+
+
 def parse_hotels(content: str) -> list[Hotel]:
     """
     Extract hotel listings from Booking.com page content.
     Works with markdown (Firecrawl), raw HTML (httpx), and HTML converted to text.
     GPS pairs are taken from the raw page (HTML scripts / URLs / markdown) then
     matched to hotels in list order.
+
+    GraphQL backend persists a JSON envelope (see config.GRAPHQL_ENVELOPE_FORMAT): parsed via
+    parse_hotels_from_graphql_responses.
     """
+    stripped = content.lstrip()
+    if stripped.startswith("{"):
+        try:
+            envelope = json.loads(content)
+        except json.JSONDecodeError:
+            envelope = None
+        else:
+            if isinstance(envelope, dict) and envelope.get("format") == GRAPHQL_ENVELOPE_FORMAT:
+                return parse_hotels_from_graphql_responses(envelope.get("responses") or [])
+
     raw = content
     coord_pairs = extract_coordinate_pairs(raw)
     text_lines = _html_to_text(raw) if _looks_like_html(raw) else raw
